@@ -1,7 +1,6 @@
-fastapi
-uvicorn
-langgraph
-langchain-core
-supabase
-python-dotenv
-groq
+fastapi>=0.115,<1
+groq>=0.15,<1
+langgraph>=0.2,<2
+supabase>=2.10,<3
+uvicorn[standard]>=0.30,<1
+typing_extensions>=4.12
