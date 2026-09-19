@@ -1,220 +1,500 @@
-from typing import Dict, Any, List, Optional
-from pydantic import BaseModel
-from langgraph.graph import StateGraph, START, END
-import os, json
-from supabase import create_client
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from functools import lru_cache
+from typing import Any
+
 from groq import Groq
-from dotenv import load_dotenv
+from langgraph.graph import END, START, StateGraph
+from supabase import create_client
+from typing_extensions import TypedDict
 
-load_dotenv()  # harmless if no .env; cloud host will set env vars
+logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+VALID_STATUSES = {
+    "needs_input",
+    "internally_consistent",
+    "needs_human_review",
+    "ready_for_next_step",
+}
 
-llm_client = Groq(api_key=os.environ["GROQ_API_KEY"])
-MODEL = "llama-3.1-70b-versatile"
 
-def call_llm(prompt: str) -> str:
-    resp = llm_client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return resp.choices[0].message.content
+class ProjectNotFound(Exception):
+    pass
 
-class Assumption(BaseModel):
-    id: str
-    owner: str
-    topic: str
-    proposed_value: Optional[float] = None
-    approved_value: Optional[float] = None
-    unit: Optional[str] = None
-    text: str
-    status: str = "proposed"
 
-class ProjectState(BaseModel):
+class PilotState(TypedDict, total=False):
     project_id: str
-    project_name: str = ""
-    validation_status: str = "pending"
-    assumptions: List[Assumption] = []
-    last_processed_chat_id: str = ""
+    project: dict[str, Any]
+    history: list[dict[str, Any]]
+    topic_info: dict[str, Any]
+    finance_advice: dict[str, Any]
+    rnd_advice: dict[str, Any]
+    ceo_advice: dict[str, Any]
+    assumptions: dict[str, Any]
+    validation_status: str
+    ai_reply: str
+    topic: str
 
-def load_project_state(project_id: str) -> ProjectState:
-    resp = supabase.table("projects").select("*").eq("id", project_id).execute()
-    row = resp.data[0]
-    return ProjectState(
-        project_id=row["id"],
-        project_name=row["project_name"] or "",
-        validation_status=row["validation_status"] or "pending",
-        assumptions=[Assumption(**a) for a in (row["assumptions"] or [])],
-        last_processed_chat_id=row["last_processed_message_id"] or "",
+
+def required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing Render environment variable: {name}")
+    return value
+
+
+@lru_cache
+def db():
+    return create_client(
+        required_env("SUPABASE_URL"),
+        required_env("SUPABASE_SERVICE_ROLE_KEY"),
     )
 
-def save_project_state(state: ProjectState):
-    supabase.table("projects").update({
-        "validation_status": state.validation_status,
-        "assumptions": [a.model_dump() for a in state.assumptions],
-        "last_processed_message_id": state.last_processed_chat_id,
-    }).eq("id", state.project_id).execute()
 
-def load_new_messages(project_id: str, last_id: str):
-    resp = (
-        supabase
-        .table("messages")
+@lru_cache
+def groq_client():
+    return Groq(api_key=required_env("GROQ_API_KEY"))
+
+
+def get_project(project_id: str) -> dict[str, Any]:
+    result = (
+        db()
+        .table("projects")
         .select("*")
-        .eq("project_id", project_id)
-        .order("created_at", desc=False)
+        .eq("id", project_id)
         .execute()
     )
-    all_msgs = resp.data
-    if not last_id:
-        return all_msgs
-    new_msgs = []
-    seen = False
-    for m in all_msgs:
-        if m["id"] == last_id:
-            seen = True
-            continue
-        if seen:
-            new_msgs.append(m)
-    return new_msgs
 
-GraphState = Dict[str, Any]
+    rows = result.data or []
+    if not rows:
+        raise ProjectNotFound()
 
-def process_chat_node(state: GraphState) -> GraphState:
-    project = load_project_state(state["project_id"])
-    new_msgs = load_new_messages(project.project_id, project.last_processed_chat_id)
-    if not new_msgs:
-        return {"project_id": project.project_id}
+    return rows[0]
 
-    chat_texts = [f"[{m['role']}] {m['text']}" for m in new_msgs]
 
-    prompt = f"""
-You are an assistant that reads chat messages from a multi-agent system with three roles: finance, rd, ceo.
-People discuss project assumptions about various topics (budget, timeline, headcount, equipment, etc.).
-
-Recent new messages:
-{json.dumps(chat_texts, indent=2, ensure_ascii=False)}
-
-Tasks:
-1. Detect all topics being discussed (e.g. "budget", "timeline", "headcount", "equipment", "travel", etc.).
-2. For each topic where someone proposes a numeric value, create a topic object with:
-   - topic: short lowercase name (e.g. "budget", "timeline_months", "headcount")
-   - proposed_value: the numeric value mentioned (float or null)
-   - unit: short unit if mentioned (e.g. "USD", "months", "people"), or null
-   - text: short description of the assumption (1 sentence)
-3. Return ONLY valid JSON with this shape:
-{{
-  "new_topics": [
-    {{
-      "id": "<unique-id>",
-      "owner": "<finance|rd|ceo>",
-      "topic": "<topic name>",
-      "proposed_value": <float or null>,
-      "unit": "<unit or null>",
-      "text": "<short description>"
-    }}
-  ],
-  "new_last_processed_message_id": "<id of last message in messages>"
-}}
-
-Rules:
-- Infer the owner from the message prefix [finance], [rd], [ceo].
-- If multiple messages refer to the same topic, create one topic per distinct idea (use your judgment).
-- Do not include any explanation, only JSON.
-"""
-
-    content = call_llm(prompt)
-    delta = json.loads(content)
-
-    for t in delta.get("new_topics", []):
-        project.assumptions.append(Assumption(
-            id=t["id"],
-            owner=t["owner"],
-            text=t["text"],
-            topic=t["topic"],
-            proposed_value=t.get("proposed_value"),
-            approved_value=None,
-            unit=t.get("unit"),
-            status="proposed",
-        ))
-
-    project.last_processed_chat_id = delta["new_last_processed_message_id"]
-    save_project_state(project)
-    return {"project_id": project.project_id}
-
-def parent_validator_node(state: GraphState) -> GraphState:
-    project = load_project_state(state["project_id"])
-
-    RULES = {
-        "budget": {"max": 50.0},
-        "timeline_months": {"max": 3.0},
-        "headcount": {"max": 5.0},
-    }
-
-    for a in project.assumptions:
-        if a.status != "proposed":
-            continue
-        if a.proposed_value is None:
-            a.approved_value = a.proposed_value
-            a.status = "approved"
-            continue
-
-        rule = RULES.get(a.topic)
-        if rule is None:
-            a.approved_value = a.proposed_value
-            a.status = "approved"
-            continue
-
-        max_val = rule["max"]
-        if a.proposed_value > max_val:
-            a.approved_value = max_val
-            a.status = "corrected"
-        else:
-            a.approved_value = a.proposed_value
-            a.status = "approved"
-
-    has_corrected = any(a.status == "corrected" for a in project.assumptions)
-    project.validation_status = "corrected" if has_corrected else "ok"
-
-    save_project_state(project)
-    return {"project_id": project.project_id}
-
-def generate_reply_node(state: GraphState) -> GraphState:
-    project = load_project_state(state["project_id"])
-    topics_text = "\n".join(
-        f"- {a.topic}: proposed {a.proposed_value}, approved {a.approved_value} ({a.status})"
-        for a in project.assumptions
+def get_recent_messages(project_id: str) -> list[dict[str, Any]]:
+    result = (
+        db()
+        .table("messages")
+        .select("role,text,created_at")
+        .eq("project_id", project_id)
+        .order("created_at", desc=True)
+        .limit(20)
+        .execute()
     )
 
-    prompt = f"""
-You are an AI assistant for a multi-agent project system.
-Based on the updated project state, write a short, friendly chat reply.
+    return list(reversed(result.data or []))
 
-Current topics:
-{topics_text}
 
-Validation status: {project.validation_status}
+def insert_message(project_id: str, role: str, text: str) -> None:
+    (
+        db()
+        .table("messages")
+        .insert(
+            {
+                "project_id": project_id,
+                "role": role,
+                "text": text,
+            }
+        )
+        .execute()
+    )
 
-Tasks:
-- Briefly confirm what was recorded.
-- If any topic was corrected, clearly explain the correction.
-- Show a short summary of current topics (budget, timeline, headcount).
-- Keep it concise and natural, like a chat message.
+
+def parse_json(content: str, fallback: dict[str, Any]) -> dict[str, Any]:
+    content = (content or "").strip()
+
+    if content.startswith("```"):
+        lines = content.splitlines()
+        content = "\n".join(lines[1:-1]).strip()
+
+    start = content.find("{")
+    end = content.rfind("}")
+
+    if start == -1 or end == -1:
+        return fallback
+
+    try:
+        result = json.loads(content[start : end + 1])
+        return result if isinstance(result, dict) else fallback
+    except json.JSONDecodeError:
+        return fallback
+
+
+def ask_llm(system_prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+    response = groq_client().chat.completions.create(
+        model=required_env("GROQ_MODEL"),
+        temperature=0.2,
+        max_completion_tokens=600,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(context)},
+        ],
+    )
+
+    return parse_json(
+        response.choices[0].message.content or "",
+        {
+            "summary": "The model did not return usable structured output.",
+            "assumptions": [],
+            "risks": [],
+            "open_questions": [],
+            "recommended_actions": [],
+        },
+    )
+
+
+def topic_detector(state: PilotState) -> dict[str, Any]:
+    logger.info("Running topic_detector for project %s", state["project_id"])
+
+    prompt = """
+You are the topic-detection step of a company decision-support system.
+
+Read the conversation. Detect its actual topic, even if it is unrelated to
+business, budgets, or software. Identify the type of decision or problem being
+discussed. Do not assume a fixed domain.
+
+Return ONLY valid JSON:
+
+{
+  "topic": "short description of the topic",
+  "domain": "business, research, education, operations, software, health workflow, or another suitable label",
+  "decision_needed": "what the user appears to need decided or clarified",
+  "context_summary": "one short summary"
+}
 """
 
-    reply = call_llm(prompt)
-    return {"project_id": project.project_id, "ai_reply": reply}
+    info = ask_llm(
+        prompt,
+        {
+            "conversation": state["history"],
+            "existing_project_data": state["project"].get("assumptions", {}),
+        },
+    )
 
-builder = StateGraph(GraphState)
+    return {"topic_info": info}
 
-builder.add_node("process_chat", process_chat_node)
-builder.add_node("parent_validator", parent_validator_node)
-builder.add_node("generate_reply", generate_reply_node)
 
-builder.add_edge(START, "process_chat")
-builder.add_edge("process_chat", "parent_validator")
-builder.add_edge("parent_validator", "generate_reply")
-builder.add_edge("generate_reply", END)
+def agent_prompt(agent_name: str, responsibility: str) -> str:
+    return f"""
+You are the {agent_name} in a multi-agent review system.
 
-graph = builder.compile()
+Your role:
+{responsibility}
+
+The conversation may concern ANY subject. First understand the detected topic.
+Do not force financial, technical, timeline, or resource assumptions where they
+are not relevant.
+
+You may identify:
+- assumptions that should be made explicit;
+- contradictions or risks;
+- information that is missing;
+- practical next actions.
+
+Return ONLY valid JSON:
+
+{{
+  "summary": "one or two short sentences",
+  "assumptions": [
+    {{
+      "name": "the assumption",
+      "value": "the assumed value or statement",
+      "confidence": "low, medium, or high"
+    }}
+  ],
+  "risks": ["risk or concern"],
+  "open_questions": ["question needing an answer"],
+  "recommended_actions": ["practical next step"]
+}}
+
+Return empty arrays when a category does not apply.
+"""
+
+
+def finance_agent(state: PilotState) -> dict[str, Any]:
+    logger.info("Running finance_agent for project %s", state["project_id"])
+
+    advice = ask_llm(
+        agent_prompt(
+            "Finance Agent",
+            "Review cost, value, affordability, incentives, commercial impact, "
+            "and resource implications only when they are relevant to the topic.",
+        ),
+        {
+            "topic_info": state["topic_info"],
+            "conversation": state["history"],
+            "previous_advice": {},
+        },
+    )
+
+    return {"finance_advice": advice}
+
+
+def rnd_agent(state: PilotState) -> dict[str, Any]:
+    logger.info("Running rnd_agent for project %s", state["project_id"])
+
+    advice = ask_llm(
+        agent_prompt(
+            "R&D Agent",
+            "Review feasibility, evidence quality, technical or operational "
+            "constraints, experimentation, and uncertainty when relevant.",
+        ),
+        {
+            "topic_info": state["topic_info"],
+            "conversation": state["history"],
+            "previous_advice": {
+                "finance": state.get("finance_advice", {}),
+            },
+        },
+    )
+
+    return {"rnd_advice": advice}
+
+
+def ceo_agent(state: PilotState) -> dict[str, Any]:
+    logger.info("Running ceo_agent for project %s", state["project_id"])
+
+    prompt = agent_prompt(
+        "CEO Agent",
+        "Synthesize the other perspectives into a clear decision-oriented "
+        "recommendation. Decide whether the information is sufficient to take "
+        "a next step, or whether human review or more input is needed.",
+    ) + """
+
+Also include one extra field:
+
+"status_recommendation": one of:
+- needs_input
+- internally_consistent
+- needs_human_review
+- ready_for_next_step
+"""
+
+    advice = ask_llm(
+        prompt,
+        {
+            "topic_info": state["topic_info"],
+            "conversation": state["history"],
+            "previous_advice": {
+                "finance": state.get("finance_advice", {}),
+                "rnd": state.get("rnd_advice", {}),
+            },
+        },
+    )
+
+    return {"ceo_advice": advice}
+
+
+def text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    return [
+        str(item).strip()[:500]
+        for item in value
+        if isinstance(item, (str, int, float)) and str(item).strip()
+    ]
+
+
+def unique(items: list[str], limit: int = 12) -> list[str]:
+    result = []
+    seen = set()
+
+    for item in items:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+
+    return result[:limit]
+
+
+def normalise_assumption(item: Any) -> dict[str, str] | None:
+    if not isinstance(item, dict):
+        return None
+
+    name = str(item.get("name", "")).strip()[:200]
+    value = str(item.get("value", "")).strip()[:500]
+    confidence = str(item.get("confidence", "medium")).lower().strip()
+
+    if not name or not value:
+        return None
+
+    if confidence not in {"low", "medium", "high"}:
+        confidence = "medium"
+
+    return {
+        "name": name,
+        "value": value,
+        "confidence": confidence,
+    }
+
+
+def merge_assumptions(advice_items: list[dict[str, Any]]) -> list[dict[str, str]]:
+    merged = {}
+
+    for advice in advice_items:
+        for item in advice.get("assumptions", []):
+            clean = normalise_assumption(item)
+            if clean:
+                # Later agents, especially CEO, can refine earlier assumptions.
+                merged[clean["name"].lower()] = clean
+
+    return list(merged.values())[:12]
+
+
+def aggregator(state: PilotState) -> dict[str, Any]:
+    logger.info("Running aggregator for project %s", state["project_id"])
+
+    finance = state.get("finance_advice", {})
+    rnd = state.get("rnd_advice", {})
+    ceo = state.get("ceo_advice", {})
+    topic_info = state.get("topic_info", {})
+
+    topic = str(topic_info.get("topic", "General discussion")).strip()[:200]
+    domain = str(topic_info.get("domain", "general")).strip()[:100]
+
+    assumptions = merge_assumptions([finance, rnd, ceo])
+
+    risks = unique(
+        text_list(finance.get("risks"))
+        + text_list(rnd.get("risks"))
+        + text_list(ceo.get("risks"))
+    )
+
+    open_questions = unique(
+        text_list(finance.get("open_questions"))
+        + text_list(rnd.get("open_questions"))
+        + text_list(ceo.get("open_questions"))
+    )
+
+    actions = unique(
+        text_list(finance.get("recommended_actions"))
+        + text_list(rnd.get("recommended_actions"))
+        + text_list(ceo.get("recommended_actions"))
+    )
+
+    status = str(
+        ceo.get("status_recommendation", "needs_human_review")
+    ).strip()
+
+    if status not in VALID_STATUSES:
+        status = "needs_human_review"
+
+    if not assumptions and open_questions:
+        status = "needs_input"
+
+    new_assumptions = {
+        "topic": topic,
+        "domain": domain,
+        "decision_needed": str(
+            topic_info.get("decision_needed", "")
+        ).strip()[:500],
+        "summary": str(ceo.get("summary", "")).strip()[:1000],
+        "assumptions": assumptions,
+        "risks": risks,
+        "open_questions": open_questions,
+        "recommended_actions": actions,
+        "last_reviewed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    summary = new_assumptions["summary"] or (
+        "The leadership team reviewed the available information."
+    )
+
+    actions_text = (
+        "\n\nNext actions:\n- " + "\n- ".join(actions[:3])
+        if actions
+        else ""
+    )
+
+    ai_reply = (
+        f"Topic: {topic}\n\n"
+        f"{summary}\n\n"
+        f"Review status: {status}."
+        f"{actions_text}"
+    )
+
+    return {
+        "topic": topic,
+        "assumptions": new_assumptions,
+        "validation_status": status,
+        "ai_reply": ai_reply,
+    }
+
+
+def save_project(state: PilotState) -> dict[str, Any]:
+    (
+        db()
+        .table("projects")
+        .update(
+            {
+                "assumptions": state["assumptions"],
+                "validation_status": state["validation_status"],
+            }
+        )
+        .eq("id", state["project_id"])
+        .execute()
+    )
+
+    logger.info("Project %s updated", state["project_id"])
+    return {}
+
+
+def build_graph():
+    graph = StateGraph(PilotState)
+
+    graph.add_node("topic_detector", topic_detector)
+    graph.add_node("finance_agent", finance_agent)
+    graph.add_node("rnd_agent", rnd_agent)
+    graph.add_node("ceo_agent", ceo_agent)
+    graph.add_node("aggregator", aggregator)
+    graph.add_node("save_project", save_project)
+
+    graph.add_edge(START, "topic_detector")
+    graph.add_edge("topic_detector", "finance_agent")
+    graph.add_edge("finance_agent", "rnd_agent")
+    graph.add_edge("rnd_agent", "ceo_agent")
+    graph.add_edge("ceo_agent", "aggregator")
+    graph.add_edge("aggregator", "save_project")
+    graph.add_edge("save_project", END)
+
+    return graph.compile()
+
+
+PILOT_GRAPH = build_graph()
+
+
+def run_pilot(project_id: str, role: str, text: str) -> dict[str, Any]:
+    if not text:
+        raise ValueError("Message text cannot be empty.")
+
+    project = get_project(project_id)
+
+    # Save the user's message, then give the full recent conversation to agents.
+    insert_message(project_id, role, text)
+    history = get_recent_messages(project_id)
+
+    final_state = PILOT_GRAPH.invoke(
+        {
+            "project_id": project_id,
+            "project": project,
+            "history": history,
+        }
+    )
+
+    ai_reply = final_state.get("ai_reply", "")
+    if not ai_reply:
+        raise RuntimeError("The graph returned no AI reply.")
+
+    insert_message(project_id, "assistant", ai_reply)
+
+    return {
+        "ai_reply": ai_reply,
+        "topic": final_state["topic"],
+        "assumptions": final_state["assumptions"],
+        "validation_status": final_state["validation_status"],
+    }
