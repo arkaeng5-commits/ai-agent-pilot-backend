@@ -77,9 +77,10 @@ def run_graph(request: RunGraphRequest):
             status_code=400,
             detail=str(error),
         )
-    except Exception:
-        logger.exception("run_graph failed")
-        raise HTTPException(
-            status_code=500,
-            detail="The server failed. Check the Render logs.",
+    except Exception as error:
+    logger.exception("run_graph failed")
+    raise HTTPException(
+        status_code=500,
+        detail=f"{type(error).__name__}: {str(error)}",
+        
         )
