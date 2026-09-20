@@ -13,14 +13,19 @@ from typing_extensions import TypedDict
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_AUDIENCES = {"finance", "rnd", "ceo", "user"}
-
 VALID_STATUSES = {
     "pending",
     "needs_input",
     "internally_consistent",
     "needs_human_review",
     "ready_for_next_step",
+}
+
+SHAREABLE_AUDIENCES = {
+    "finance",
+    "rnd",
+    "ceo",
+    "user",
 }
 
 
@@ -34,7 +39,7 @@ class PilotState(TypedDict, total=False):
     history: list[dict[str, Any]]
 
     public_state: dict[str, Any]
-    private_ceo_state: dict[str, Any]
+    ceo_private_state: dict[str, Any]
     agent_inboxes: dict[str, list[dict[str, Any]]]
 
     topic_info: dict[str, Any]
@@ -42,20 +47,22 @@ class PilotState(TypedDict, total=False):
     rnd_result: dict[str, Any]
     ceo_decision: dict[str, Any]
 
-    updated_public_state: dict[str, Any]
-    updated_private_ceo_state: dict[str, Any]
-    updated_agent_inboxes: dict[str, list[dict[str, Any]]]
-
     finance_reply: str
     rnd_reply: str
-    ceo_public_reply: str
+    ceo_reply: str
+
+    updated_public_state: dict[str, Any]
+    updated_ceo_private_state: dict[str, Any]
+    updated_agent_inboxes: dict[str, list[dict[str, Any]]]
     validation_status: str
 
 
 def required_env(name: str) -> str:
     value = os.getenv(name)
+
     if not value:
         raise RuntimeError(f"Missing Render environment variable: {name}")
+
     return value
 
 
@@ -107,7 +114,7 @@ def insert_message(
     project_id: str,
     role: str,
     text: str,
-    metadata: dict[str, Any] | None = None,
+    metadata: dict[str, Any],
 ) -> None:
     (
         db()
@@ -117,11 +124,41 @@ def insert_message(
                 "project_id": project_id,
                 "role": role,
                 "text": text,
-                "metadata": metadata or {},
+                "metadata": metadata,
             }
         )
         .execute()
     )
+
+
+def safe_text(value: Any, limit: int = 1000) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def safe_list(value: Any, limit: int = 10) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    result = []
+
+    for item in value:
+        text = safe_text(item, 500)
+
+        if text:
+            result.append(text)
+
+    return result[:limit]
+
+
+def safe_audience(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    return [
+        item
+        for item in value
+        if isinstance(item, str) and item in SHAREABLE_AUDIENCES
+    ]
 
 
 def ask_llm(
@@ -133,91 +170,76 @@ def ask_llm(
         model=required_env("GROQ_MODEL"),
         temperature=0.2,
         max_completion_tokens=700,
+        response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(context)},
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": json.dumps(context),
+            },
         ],
     )
 
     content = (response.choices[0].message.content or "").strip()
 
-    if content.startswith("```"):
-        lines = content.splitlines()
-        content = "\n".join(lines[1:-1]).strip()
-
-    start = content.find("{")
-    end = content.rfind("}")
-
-    if start == -1 or end == -1:
-        return fallback
-
     try:
-        output = json.loads(content[start : end + 1])
-        return output if isinstance(output, dict) else fallback
+        result = json.loads(content)
+
+        if isinstance(result, dict):
+            return result
     except json.JSONDecodeError:
-        return fallback
+        logger.warning("LLM did not return valid JSON: %s", content[:300])
 
-
-def safe_text(value: Any, max_length: int = 500) -> str:
-    return str(value or "").strip()[:max_length]
-
-
-def safe_audience(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-
-    return [
-        item
-        for item in value
-        if isinstance(item, str) and item in ALLOWED_AUDIENCES
-    ]
+    return fallback
 
 
 def empty_inboxes() -> dict[str, list[dict[str, Any]]]:
     return {
         "finance": [],
         "rnd": [],
-        "ceo": [],
     }
 
 
-def load_project_state(project: dict[str, Any]) -> tuple[
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, list[dict[str, Any]]],
-]:
+def load_project_state(
+    project: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, list[dict[str, Any]]]]:
     stored = project.get("assumptions") or {}
 
     if not isinstance(stored, dict):
         stored = {}
 
-    # Converts old assumption formats into the new format safely.
-    if "public" in stored:
-        public_state = deepcopy(stored.get("public") or {})
+    # Supports both the new format and your earlier format.
+    if isinstance(stored.get("public"), dict):
+        public_state = deepcopy(stored["public"])
     else:
         public_state = {
-            "topic": safe_text(stored.get("topic", "New discussion")),
+            "topic": safe_text(stored.get("topic", "New discussion"), 200),
             "parameters": {},
-            "status": stored.get("validation_status", "pending"),
+            "status": project.get("validation_status", "pending"),
         }
 
-    private_ceo_state = deepcopy(stored.get("private_ceo") or {})
-
-    saved_inboxes = stored.get("agent_inboxes") or {}
-    agent_inboxes = empty_inboxes()
-
-    for agent in agent_inboxes:
-        inbox = saved_inboxes.get(agent, [])
-        if isinstance(inbox, list):
-            agent_inboxes[agent] = inbox[-20:]
+    ceo_private_state = deepcopy(stored.get("private_ceo") or {})
 
     public_state.setdefault("topic", "New discussion")
     public_state.setdefault("parameters", {})
     public_state.setdefault("status", "pending")
 
-    private_ceo_state.setdefault("parameters", {})
+    ceo_private_state.setdefault("parameters", {})
 
-    return public_state, private_ceo_state, agent_inboxes
+    inboxes = empty_inboxes()
+    saved_inboxes = stored.get("agent_inboxes") or {}
+
+    if isinstance(saved_inboxes, dict):
+        for agent in inboxes:
+            messages = saved_inboxes.get(agent)
+
+            if isinstance(messages, list):
+                inboxes[agent] = messages[-20:]
+
+    return public_state, ceo_private_state, inboxes
 
 
 def visible_public_state(
@@ -227,39 +249,42 @@ def visible_public_state(
     visible_parameters = {}
 
     for name, parameter in public_state.get("parameters", {}).items():
-        shared_with = parameter.get("shared_with", [])
+        if not isinstance(parameter, dict):
+            continue
 
-        if audience in shared_with:
-            visible_parameters[name] = {
-                "value": parameter.get("value"),
-                "reason": parameter.get("reason"),
-                "last_revised_by": parameter.get("last_revised_by"),
-                "revision": parameter.get("revision"),
-            }
+        if audience not in parameter.get("shared_with", []):
+            continue
+
+        visible_parameters[name] = {
+            "value": parameter.get("value"),
+            "reason": parameter.get("reason"),
+            "last_revised_by": parameter.get("last_revised_by"),
+            "revision": parameter.get("revision"),
+        }
 
     return {
         "topic": public_state.get("topic"),
-        "status": public_state.get("status"),
+        "decision_needed": public_state.get("decision_needed", ""),
+        "status": public_state.get("status", "pending"),
         "parameters": visible_parameters,
     }
 
 
 def topic_detector(state: PilotState) -> dict[str, Any]:
-    logger.info("Running topic detector")
+    logger.info("Running Topic Detector")
 
     result = ask_llm(
         """
-You detect the topic of a discussion.
+You identify the topic and decision being discussed.
 
-The subject may be anything: business, education, research, operations,
-technology, policy, or another area.
+The topic can be anything. Do not assume it is a business, finance,
+technology, or budget discussion.
 
-Return ONLY JSON:
+Return JSON only:
 
 {
-  "topic": "short topic title",
-  "decision_needed": "what needs to be decided",
-  "summary": "short context summary"
+  "topic": "short title",
+  "decision_needed": "what should be decided or clarified"
 }
 """,
         {
@@ -271,8 +296,7 @@ Return ONLY JSON:
         },
         {
             "topic": "New discussion",
-            "decision_needed": "Needs clarification",
-            "summary": "",
+            "decision_needed": "More information is needed.",
         },
     )
 
@@ -286,54 +310,49 @@ def finance_agent(state: PilotState) -> dict[str, Any]:
         """
 You are the Finance Agent.
 
-Review only information that is visible to you. Never invent hidden facts.
-Consider costs, value, resources, incentives, affordability, or commercial
-impact only when relevant to the topic.
+You can see only the supplied public project information. Do not invent
+private facts or assume every topic needs a budget.
 
-Write a real, helpful response addressed to the user.
+Write a direct, useful, natural-language reply for the user. Discuss cost,
+value, incentives, affordability, or resources only when relevant.
 
-Return ONLY JSON:
+You may propose parameters, but the CEO has final authority. Your proposals
+are not final decisions.
+
+Return JSON only:
 
 {
-  "public_reply": "Your natural-language reply for the user.",
+  "public_reply": "Your real response to the user.",
   "proposed_parameters": [
     {
       "name": "parameter name",
-      "value": "proposed value",
+      "value": "suggested value",
       "reason": "why"
     }
-  ],
-  "risks": ["public risk"],
-  "questions": ["public question"]
+  ]
 }
 """,
         {
             "topic": state["topic_info"],
-            "visible_project_state": visible_public_state(
+            "public_project_state": visible_public_state(
                 state["public_state"],
                 "finance",
             ),
-            "notifications_for_finance": state["agent_inboxes"].get(
-                "finance",
-                [],
-            ),
+            "ceo_notifications": state["agent_inboxes"].get("finance", []),
             "conversation": state["history"],
         },
         {
-            "public_reply": "Finance could not produce a structured response.",
+            "public_reply": "Finance could not complete its review.",
             "proposed_parameters": [],
-            "risks": [],
-            "questions": [],
         },
     )
 
-    inboxes = deepcopy(state["agent_inboxes"])
-    inboxes["finance"] = []
-
     return {
         "finance_result": result,
-        "finance_reply": safe_text(result.get("public_reply")),
-        "agent_inboxes": inboxes,
+        "finance_reply": safe_text(
+            result.get("public_reply"),
+            3000,
+        ),
     }
 
 
@@ -344,88 +363,82 @@ def rnd_agent(state: PilotState) -> dict[str, Any]:
         """
 You are the R&D Agent.
 
-Review only information visible to you. Consider feasibility, evidence,
-technical or operational constraints, experimentation, and uncertainty only
-when relevant to the topic.
+You can see only the supplied public project information. Do not invent
+private facts or assume every topic is technical.
 
-Write a real, helpful response addressed to the user.
+Write a direct, useful, natural-language reply for the user. Discuss
+feasibility, evidence, experimentation, technical or operational constraints,
+and uncertainty only when relevant.
 
-Return ONLY JSON:
+You may propose parameters, but the CEO has final authority. Your proposals
+are not final decisions.
+
+Return JSON only:
 
 {
-  "public_reply": "Your natural-language reply for the user.",
+  "public_reply": "Your real response to the user.",
   "proposed_parameters": [
     {
       "name": "parameter name",
-      "value": "proposed value",
+      "value": "suggested value",
       "reason": "why"
     }
-  ],
-  "risks": ["public risk"],
-  "questions": ["public question"]
+  ]
 }
 """,
         {
             "topic": state["topic_info"],
-            "visible_project_state": visible_public_state(
+            "public_project_state": visible_public_state(
                 state["public_state"],
                 "rnd",
             ),
-            "notifications_for_rnd": state["agent_inboxes"].get(
-                "rnd",
-                [],
-            ),
-            "finance_agent_public_reply": state["finance_reply"],
+            "ceo_notifications": state["agent_inboxes"].get("rnd", []),
+            "finance_agent_reply": state["finance_reply"],
             "conversation": state["history"],
         },
         {
-            "public_reply": "R&D could not produce a structured response.",
+            "public_reply": "R&D could not complete its review.",
             "proposed_parameters": [],
-            "risks": [],
-            "questions": [],
         },
     )
 
-    inboxes = deepcopy(state["agent_inboxes"])
-    inboxes["rnd"] = []
-
     return {
         "rnd_result": result,
-        "rnd_reply": safe_text(result.get("public_reply")),
-        "agent_inboxes": inboxes,
+        "rnd_reply": safe_text(
+            result.get("public_reply"),
+            3000,
+        ),
     }
 
 
 def ceo_decision_agent(state: PilotState) -> dict[str, Any]:
-    logger.info("Running CEO private decision step")
+    logger.info("Running CEO decision agent")
 
     result = ask_llm(
         """
-You are the CEO decision-maker.
+You are the CEO and have final decision authority.
 
-You may see private CEO information. Never place private information into
-approved_parameters or revisions unless you explicitly decide it should be
-shared.
+Finance and R&D proposals are suggestions. You decide whether to approve,
+revise, or reject them.
 
-Finance and R&D proposals are suggestions only. You have the final authority
-to approve, revise, or reject parameters.
+A revision replaces an existing parameter with the same name. Example:
+Finance proposes "budget = $300"; CEO revises "budget = $250".
+Your revised value is the final value.
 
-If you revise a parameter, use the same exact parameter name. For example,
-Finance can propose budget = $300 and you can revise budget = $250.
-
-For every approved or revised parameter, decide who may see it:
+For every public parameter, choose exactly who may see it:
 finance, rnd, ceo, user.
 
-Put CEO-only secrets in private_parameters. These are never sent to the user,
-Finance, or R&D.
+Use private_parameters for CEO-only secrets. These private parameters must
+never appear in approved_parameters or revisions. Do not describe private
+parameters in a public reply.
 
-Return ONLY JSON:
+Return JSON only:
 
 {
   "approved_parameters": [
     {
       "name": "parameter",
-      "value": "approved value",
+      "value": "final value",
       "reason": "reason",
       "share_with": ["finance", "rnd", "ceo", "user"]
     }
@@ -433,7 +446,7 @@ Return ONLY JSON:
   "revisions": [
     {
       "name": "existing parameter",
-      "value": "revised value",
+      "value": "revised final value",
       "reason": "reason",
       "share_with": ["finance", "rnd", "ceo", "user"]
     }
@@ -442,7 +455,7 @@ Return ONLY JSON:
     {
       "name": "CEO-only parameter",
       "value": "secret value",
-      "reason": "why it remains private"
+      "reason": "why it remains CEO-only"
     }
   ],
   "status": "needs_input, internally_consistent, needs_human_review, or ready_for_next_step"
@@ -450,13 +463,13 @@ Return ONLY JSON:
 """,
         {
             "topic": state["topic_info"],
-            "ceo_visible_public_state": visible_public_state(
+            "public_project_state_visible_to_ceo": visible_public_state(
                 state["public_state"],
                 "ceo",
             ),
-            "ceo_private_state": state["private_ceo_state"],
-            "finance_proposal": state["finance_result"],
-            "rnd_proposal": state["rnd_result"],
+            "ceo_private_state": state["ceo_private_state"],
+            "finance_proposals": state["finance_result"],
+            "rnd_proposals": state["rnd_result"],
         },
         {
             "approved_parameters": [],
@@ -490,10 +503,10 @@ def normalise_parameter(item: Any) -> dict[str, Any] | None:
 
 
 def apply_ceo_decisions(state: PilotState) -> dict[str, Any]:
-    logger.info("Applying CEO decisions")
+    logger.info("Applying CEO parameter decisions")
 
     public_state = deepcopy(state["public_state"])
-    private_state = deepcopy(state["private_ceo_state"])
+    private_state = deepcopy(state["ceo_private_state"])
     inboxes = deepcopy(state["agent_inboxes"])
 
     public_parameters = public_state.get("parameters", {})
@@ -501,68 +514,69 @@ def apply_ceo_decisions(state: PilotState) -> dict[str, Any]:
 
     decision = state["ceo_decision"]
 
-    # Approved parameters are applied first.
-    # Revisions are applied second and therefore always win.
+    # Revisions are placed after approvals. Therefore, if both use the same
+    # parameter name, the CEO revision always becomes the saved final value.
     directives = (
         decision.get("approved_parameters", [])
         + decision.get("revisions", [])
     )
 
-    for raw_item in directives:
-        item = normalise_parameter(raw_item)
+    for raw_parameter in directives:
+        parameter = normalise_parameter(raw_parameter)
 
-        if not item:
+        if not parameter:
             continue
 
-        name = item["name"]
-        audience = item["share_with"]
+        name = parameter["name"]
+        share_with = parameter["share_with"]
 
-        # A parameter shared with nobody becomes CEO-private.
-        if not audience or audience == ["ceo"]:
+        # CEO-only parameter: stored privately and never sent to other agents.
+        if not share_with or share_with == ["ceo"]:
             private_parameters[name] = {
-                "value": item["value"],
-                "reason": item["reason"],
+                "value": parameter["value"],
+                "reason": parameter["reason"],
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             continue
 
-        previous = public_parameters.get(name, {})
-        revision_number = int(previous.get("revision", 0)) + 1
+        old_parameter = public_parameters.get(name, {})
+        revision = int(old_parameter.get("revision", 0)) + 1
 
         public_parameters[name] = {
-            "value": item["value"],
-            "reason": item["reason"],
-            "shared_with": audience,
-            "last_revised_by": "ceo",
-            "revision": revision_number,
+            "value": parameter["value"],
+            "reason": parameter["reason"],
+            "shared_with": share_with,
+            "last_revised_by": "CEO",
+            "revision": revision,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        # Finance and R&D receive an internal notice on their next turn.
+        # A section receives the CEO update only if CEO chose to share it.
+        # It will see this notification during its next agent turn.
         for agent in ("finance", "rnd"):
-            if agent in audience:
+            if agent in share_with:
                 inboxes[agent].append(
                     {
                         "type": "CEO parameter update",
                         "parameter": name,
-                        "value": item["value"],
-                        "reason": item["reason"],
+                        "value": parameter["value"],
+                        "reason": parameter["reason"],
                     }
                 )
 
-    # Explicit CEO secrets never become public parameters.
-    for raw_item in decision.get("private_parameters", []):
-        item = normalise_parameter(
+    # Explicit secrets always remain separate from public state.
+    for raw_parameter in decision.get("private_parameters", []):
+        parameter = normalise_parameter(
             {
-                **raw_item,
+                **raw_parameter,
                 "share_with": [],
             }
         )
 
-        if item:
-            private_parameters[item["name"]] = {
-                "value": item["value"],
-                "reason": item["reason"],
+        if parameter:
+            private_parameters[parameter["name"]] = {
+                "value": parameter["value"],
+                "reason": parameter["reason"],
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -575,7 +589,7 @@ def apply_ceo_decisions(state: PilotState) -> dict[str, Any]:
         status = "needs_human_review"
 
     public_state["topic"] = safe_text(
-        state["topic_info"].get("topic", public_state.get("topic")),
+        state["topic_info"].get("topic", public_state["topic"]),
         200,
     )
     public_state["decision_needed"] = safe_text(
@@ -590,41 +604,41 @@ def apply_ceo_decisions(state: PilotState) -> dict[str, Any]:
 
     return {
         "updated_public_state": public_state,
-        "updated_private_ceo_state": private_state,
+        "updated_ceo_private_state": private_state,
         "updated_agent_inboxes": inboxes,
         "validation_status": status,
     }
 
 
 def ceo_public_reply_agent(state: PilotState) -> dict[str, Any]:
-    logger.info("Running CEO public reply step")
+    logger.info("Running CEO public reply agent")
 
-    # This LLM call never receives CEO-private state.
-    # Therefore it cannot reveal private CEO parameters.
+    # This call intentionally receives no CEO-private state.
+    # It cannot reveal a CEO-private parameter it was never given.
     result = ask_llm(
         """
-You are the CEO communicating with the user.
+You are the CEO speaking to the user.
 
-Write a clear, helpful, natural-language reply based ONLY on the public
-information supplied to you. Do not mention hidden or private information.
+Write a clear, direct natural-language response. Use ONLY the supplied public
+project state. Never mention a parameter that is not visible to the user.
 
-Explain only the parameters shared with the user. If a parameter is not shown
-in the public project state, do not mention it.
+Explain relevant approved or revised public parameters. Do not mention that
+private information exists.
 
-Return ONLY JSON:
+Return JSON only:
 
 {
-  "public_reply": "Your complete reply for the user."
+  "public_reply": "Your complete response to the user."
 }
 """,
         {
             "topic": state["topic_info"],
-            "public_project_state_visible_to_user": visible_public_state(
+            "user_visible_project_state": visible_public_state(
                 state["updated_public_state"],
                 "user",
             ),
-            "finance_agent_public_reply": state["finance_reply"],
-            "rnd_agent_public_reply": state["rnd_reply"],
+            "finance_agent_reply": state["finance_reply"],
+            "rnd_agent_reply": state["rnd_reply"],
             "status": state["validation_status"],
         },
         {
@@ -633,17 +647,17 @@ Return ONLY JSON:
     )
 
     return {
-        "ceo_public_reply": safe_text(
+        "ceo_reply": safe_text(
             result.get("public_reply"),
             3000,
-        ),
+        )
     }
 
 
 def save_project(state: PilotState) -> dict[str, Any]:
-    stored_assumptions = {
+    assumptions = {
         "public": state["updated_public_state"],
-        "private_ceo": state["updated_private_ceo_state"],
+        "private_ceo": state["updated_ceo_private_state"],
         "agent_inboxes": state["updated_agent_inboxes"],
     }
 
@@ -652,7 +666,7 @@ def save_project(state: PilotState) -> dict[str, Any]:
         .table("projects")
         .update(
             {
-                "assumptions": stored_assumptions,
+                "assumptions": assumptions,
                 "validation_status": state["validation_status"],
             }
         )
@@ -660,7 +674,7 @@ def save_project(state: PilotState) -> dict[str, Any]:
         .execute()
     )
 
-    logger.info("Project updated")
+    logger.info("Project updated successfully")
     return {}
 
 
@@ -695,13 +709,17 @@ def run_pilot(project_id: str, role: str, text: str) -> dict[str, Any]:
         raise ValueError("Message text cannot be empty.")
 
     project = get_project(project_id)
-    public_state, private_ceo_state, inboxes = load_project_state(project)
+
+    public_state, ceo_private_state, inboxes = load_project_state(project)
 
     insert_message(
         project_id,
         role,
         text,
-        {"agent": "user", "visibility": "public"},
+        {
+            "agent": "User",
+            "visibility": "public",
+        },
     )
 
     history = get_recent_messages(project_id)
@@ -712,13 +730,11 @@ def run_pilot(project_id: str, role: str, text: str) -> dict[str, Any]:
             "project": project,
             "history": history,
             "public_state": public_state,
-            "private_ceo_state": private_ceo_state,
+            "ceo_private_state": ceo_private_state,
             "agent_inboxes": inboxes,
         }
     )
 
-    # These are real LLM-generated public replies.
-    # No private CEO decision is inserted into messages.
     agent_messages = [
         {
             "agent": "Finance Agent",
@@ -730,10 +746,11 @@ def run_pilot(project_id: str, role: str, text: str) -> dict[str, Any]:
         },
         {
             "agent": "CEO Agent",
-            "text": final_state["ceo_public_reply"],
+            "text": final_state["ceo_reply"],
         },
     ]
 
+    # Save only public LLM replies. CEO secrets are never saved in messages.
     for message in agent_messages:
         insert_message(
             project_id,
@@ -746,7 +763,7 @@ def run_pilot(project_id: str, role: str, text: str) -> dict[str, Any]:
         )
 
     return {
-        "ai_reply": final_state["ceo_public_reply"],
+        "ai_reply": final_state["ceo_reply"],
         "topic": final_state["updated_public_state"]["topic"],
         "assumptions": final_state["updated_public_state"],
         "validation_status": final_state["validation_status"],
