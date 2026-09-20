@@ -78,9 +78,9 @@ def run_graph(request: RunGraphRequest):
             detail=str(error),
         )
     except Exception as error:
-    logger.exception("run_graph failed")
-    raise HTTPException(
-        status_code=500,
-        detail=f"{type(error).__name__}: {str(error)}",
+        logger.exception("run_graph failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"{type(error).__name__}: {str(error)}",
         
         )
