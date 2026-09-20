@@ -18,7 +18,7 @@ origins = [
     if item.strip()
 ]
 
-app = FastAPI(title="Any-Topic AI Pilot API")
+app = FastAPI(title="AI Pilot API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,6 +40,7 @@ class RunGraphResponse(BaseModel):
     topic: str
     assumptions: dict[str, Any]
     validation_status: str
+    agent_messages: list[dict[str, str]]
 
 
 @app.get("/health")
@@ -49,12 +50,6 @@ def health():
 
 @app.post("/run_graph", response_model=RunGraphResponse)
 def run_graph(request: RunGraphRequest):
-    logger.info(
-        "run_graph started: project_id=%s role=%s",
-        request.project_id,
-        request.role,
-    )
-
     try:
         return run_pilot(
             project_id=str(request.project_id),
