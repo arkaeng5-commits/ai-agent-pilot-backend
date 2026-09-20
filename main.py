@@ -13,9 +13,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 origins = [
-    item.strip().rstrip("/")
-    for item in os.getenv("FRONTEND_ORIGINS", "").split(",")
-    if item.strip()
+    origin.strip().rstrip("/")
+    for origin in os.getenv("FRONTEND_ORIGINS", "").split(",")
+    if origin.strip()
 ]
 
 app = FastAPI(title="AI Pilot API")
@@ -35,12 +35,17 @@ class RunGraphRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
 
 
+class AgentMessage(BaseModel):
+    agent: str
+    text: str
+
+
 class RunGraphResponse(BaseModel):
     ai_reply: str
     topic: str
     assumptions: dict[str, Any]
     validation_status: str
-    agent_messages: list[dict[str, str]]
+    agent_messages: list[AgentMessage]
 
 
 @app.get("/health")
@@ -50,6 +55,12 @@ def health():
 
 @app.post("/run_graph", response_model=RunGraphResponse)
 def run_graph(request: RunGraphRequest):
+    logger.info(
+        "run_graph started: project_id=%s role=%s",
+        request.project_id,
+        request.role,
+    )
+
     try:
         return run_pilot(
             project_id=str(request.project_id),
