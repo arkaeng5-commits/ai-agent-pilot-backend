@@ -1,24 +1,23 @@
 import logging
 import os
-from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from agents import ProjectNotFound, run_pilot
+from agents import ProjectNotFound, get_section_messages, run_project_chat
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 origins = [
-    origin.strip().rstrip("/")
-    for origin in os.getenv("FRONTEND_ORIGINS", "").split(",")
-    if origin.strip()
+    item.strip().rstrip("/")
+    for item in os.getenv("FRONTEND_ORIGINS", "").split(",")
+    if item.strip()
 ]
 
-app = FastAPI(title="AI Pilot API")
+app = FastAPI(title="Section and CEO Project API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,23 +28,10 @@ app.add_middleware(
 )
 
 
-class RunGraphRequest(BaseModel):
+class ChatRequest(BaseModel):
     project_id: UUID
-    role: Literal["finance", "rnd", "ceo"]
+    section_tag: str = Field(min_length=2, max_length=50)
     text: str = Field(min_length=1, max_length=4000)
-
-
-class AgentMessage(BaseModel):
-    agent: str
-    text: str
-
-
-class RunGraphResponse(BaseModel):
-    ai_reply: str
-    topic: str
-    assumptions: dict[str, Any]
-    validation_status: str
-    agent_messages: list[AgentMessage]
 
 
 @app.get("/health")
@@ -53,18 +39,32 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/run_graph", response_model=RunGraphResponse)
-def run_graph(request: RunGraphRequest):
-    logger.info(
-        "run_graph started: project_id=%s role=%s",
-        request.project_id,
-        request.role,
-    )
-
+@app.get("/projects/{project_id}/messages")
+def project_messages(
+    project_id: UUID,
+    section_tag: str,
+):
     try:
-        return run_pilot(
+        return {
+            "messages": get_section_messages(
+                project_id=str(project_id),
+                section_tag=section_tag.strip().lower(),
+            )
+        }
+    except Exception:
+        logger.exception("Could not load messages")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not load this section's messages.",
+        )
+
+
+@app.post("/run_graph")
+def run_graph(request: ChatRequest):
+    try:
+        return run_project_chat(
             project_id=str(request.project_id),
-            role=request.role,
+            section_tag=request.section_tag.strip().lower(),
             text=request.text.strip(),
         )
     except ProjectNotFound:
@@ -77,10 +77,9 @@ def run_graph(request: RunGraphRequest):
             status_code=400,
             detail=str(error),
         )
-    except Exception as error:
+    except Exception:
         logger.exception("run_graph failed")
         raise HTTPException(
             status_code=500,
-            detail=f"{type(error).__name__}: {str(error)}",
-        
+            detail="The server failed. Check Render Logs.",
         )
