@@ -1,24 +1,24 @@
 import logging
 import os
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from agents import ProjectNotFound, get_section_messages, run_project_chat
+from agents import ProjectNotFound, run_pilot
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 origins = [
-    item.strip().rstrip("/")
-    for item in os.getenv("FRONTEND_ORIGINS", "").split(",")
-    if item.strip()
+    i.strip().rstrip("/")
+    for i in os.getenv("FRONTEND_ORIGINS", "").split(",")
+    if i.strip()
 ]
 
-app = FastAPI(title="Section and CEO Project API")
-
+app = FastAPI(title="Any-Topic AI Pilot API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -28,58 +28,37 @@ app.add_middleware(
 )
 
 
-class ChatRequest(BaseModel):
+class RunGraphRequest(BaseModel):
     project_id: UUID
-    section_tag: str = Field(min_length=2, max_length=50)
+    role: Literal["finance", "rnd", "ceo"]
     text: str = Field(min_length=1, max_length=4000)
 
 
+class RunGraphResponse(BaseModel):
+    ai_reply: str
+    topic: str
+    assumptions: dict[str, Any]
+    validation_status: str
+
+
 @app.get("/health")
-def health():
+def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/projects/{project_id}/messages")
-def project_messages(
-    project_id: UUID,
-    section_tag: str,
-):
+@app.post("/run_graph", response_model=RunGraphResponse)
+def run_graph(req: RunGraphRequest) -> RunGraphResponse:
     try:
-        return {
-            "messages": get_section_messages(
-                project_id=str(project_id),
-                section_tag=section_tag.strip().lower(),
-            )
-        }
-    except Exception:
-        logger.exception("Could not load messages")
-        raise HTTPException(
-            status_code=500,
-            detail="Could not load this section's messages.",
+        result = run_pilot(
+            project_id=str(req.project_id),
+            role=req.role,
+            text=req.text.strip(),
         )
-
-
-@app.post("/run_graph")
-def run_graph(request: ChatRequest):
-    try:
-        return run_project_chat(
-            project_id=str(request.project_id),
-            section_tag=request.section_tag.strip().lower(),
-            text=request.text.strip(),
-        )
-    except ProjectNotFound:
-        raise HTTPException(
-            status_code=404,
-            detail="Project ID was not found.",
-        )
-    except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        )
-    except Exception:
-        logger.exception("run_graph failed")
-        raise HTTPException(
-            status_code=500,
-            detail="The server failed. Check Render Logs.",
-        )
+        return RunGraphResponse(**result)
+    except ProjectNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Unhandled error in /run_graph")
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
